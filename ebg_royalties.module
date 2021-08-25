@@ -1,0 +1,314 @@
+<?php
+
+/**
+ * @File
+ * Custom module for tracking royalties and payments for authors.
+ */
+
+function ebg_royalties_menu() {
+  $menu = array();
+
+  $menu['admin/config/ebg/royalties/dashboard'] = array(
+    'title' => t('EBooks Galore Royalty Admin Dashboard'),
+    'page callback' => 'ebg_royalties_dashboard',
+    'page arguments' => array(NULL),
+    'access arguments' => array('administer ebg royalties'),
+    'file' => 'ebg_royalties.admin.inc',
+  );
+
+  $menu['admin/config/ebg/royalties/payments'] = array(
+    'title' => t('EBooks Galore Royalty Payments'),
+    'page callback' => 'ebg_royalties_payments',
+    'page arguments' => array(NULL),
+    'access arguments' => array('administer ebg royalties'),
+    'file' => 'ebg_royalties.admin.inc',
+  );
+
+  $menu['admin/config/ebg/royalties/payments/%/edit'] = array(
+    'title' => t('Add Royalty Payment'),
+    'page callback' => 'ebg_royalties_payments',
+    'page arguments' => array(5),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer ebg royalties'),
+    'file' => 'ebg_royalties.admin.inc',
+  );
+
+  $menu['admin/config/ebg/royalties/payments/%/delete'] = array(
+    'title' => t('Edit Royalty Payment'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ebg_royalties_payment_delete_form', 5),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer ebg royalties'),
+    'file' => 'ebg_royalties.admin.inc',
+  );
+
+  return $menu;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function ebg_royalties_permission() {
+  return array(
+    'administer ebg royalties' => array(
+      'title' => t('Administer royalties'),
+      'description' => t('Add/Edit royalty payments.'),
+    ),
+    'view own ebg royalties' => array(
+      'title' => t('View own royalties'),
+      'description' => t('View own owed royalties and payments.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_user_view().
+ */
+function ebg_royalties_user_view($account, $view_mode, $langcode) {
+  global $user;
+
+  if (user_access('administer ebg royalties') || ($user->uid == $account->uid && user_access('view own ebg royalties'))) {
+    $royalties = _ebg_royalties_by_user($account->uid);
+
+    $account->content['ebg_royalties_dashboard'] = array(
+      '#title' => '<none>',
+      '#markup' => theme('ebg_user_royalties', array('royalties' => $royalties)),
+      '#weight' => -20,
+    );
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ebg_royalties_theme($existing, $type, $theme, $path) {
+  return array(
+    'ebg_user_royalties' => array(
+      'variables' => array('royalties' => array()),
+      'template' => 'user-royalties',
+    ),
+  );
+}
+
+/**
+ * Implements hook_preprocess_ebg_user_royalties().
+ */
+function ebg_royalties_preprocess_ebg_user_royalties(&$variables) {
+  if (!isset($variables['royalties']['gross_royalties']['amount_formatted'])) {
+    $variables['royalties']['gross_royalties']['amount_formatted'] = '$0';
+  }
+  if (!isset($variables['royalties']['net_royalties']['amount_formatted'])) {
+    $variables['royalties']['net_royalties']['amount_formatted'] = '$0';
+  }
+
+
+  drupal_add_css(drupal_get_path('module', 'ebg_royalties') . '/css/royalties-dashboard.css');
+
+  $header = array(
+    t('Book title'),
+    t('Qty'),
+    t('Total'),
+  );
+
+  $rows = array();
+  $total_books = 0;
+  foreach ($variables['royalties']['books'] as $book_title => $book_data) {
+    $total_books += $book_data['qty'];
+
+    $rows[] = array(
+      check_plain($book_title),
+      check_plain($book_data['qty']),
+      check_plain(commerce_currency_format($book_data['total'], 'USD')),
+    );
+  }
+
+  // Books sold footer
+  if (count($rows) > 0) {
+    $rows[] = array(
+      'data' => array(
+        t('Books Sold'),
+        array('data' => $total_books),
+      ),
+      'class' => array('footer'),
+    );
+  }
+
+  $books = theme('table', array(
+    'header' => $header,
+    'rows' => $rows,
+    'empty' => t('No sales.'),
+    'sticky' => FALSE,
+    'attributes' => array(
+      'class' => array('royalties', 'royalties-earned'),
+    ),
+  ));
+
+  $variables['sales_table'] = $books;
+
+  $header = array(
+    t('Date'),
+    t('Amount'),
+  );
+
+  $rows = array();
+  foreach ($variables['royalties']['payments'] as $payment) {
+    $rows[] = array(
+      check_plain(date('m/d/Y', $payment->date)),
+      '$' . check_plain($payment->amount),
+    );
+  }
+
+  $payments = theme('table', array(
+    'header' => $header,
+    'rows' => $rows,
+    'empty' => t('No payments.'),
+    'sticky' => FALSE,
+    'attributes' => array(
+      'class' => array('royalties', 'royalties-payed'),
+    ),
+  ));
+
+  $variables['payments_table'] = $payments;
+}
+
+function _ebg_royalties_by_user($uid = NULL) {
+  $data = array(
+    'books' => array(),
+    'gross_royalties' => array(),
+    'payments' => array(),
+    'net_royalties' => array(),
+  );
+
+  // Find all the commerce products this user gets credit for
+  $efq = new EntityFieldQuery();
+  $efq->entityCondition('entity_type', 'node')
+      ->entityCondition('bundle', 'book_displays')
+      ->propertyCondition('uid', $uid);
+  $results = $efq->execute();
+
+  if (!isset($results['node'])) {
+    return $data;
+  }
+
+  $nids = array_keys($results['node']);
+  $nodes = node_load_multiple($nids);
+
+  // Find all the product variants for these displays
+  $products = array();
+  foreach ($nodes as $nid => $node) {
+    $node_wrapper = entity_metadata_wrapper('node', $node);
+    $epub = $node_wrapper->field_product->value();
+    
+    if (is_array($epub)) {
+      $products = array_merge($products, $epub);
+    }
+    else {
+      $products[] = $epub;
+    }
+    
+    $mobie = $node_wrapper->field_mobi_download->value();
+    
+    if (is_array($mobie)) {
+      $products = array_merge($products, $mobie);
+    }
+    else {
+      $products[] = $mobie;
+    }
+  }
+
+  $pids = array_map(function($n) {
+    if (!isset($n->product_id)) {
+      return NULL;
+    }
+    
+    return $n->product_id;
+  }, $products);
+  $pids = array_filter($pids);
+  
+  if (count($pids) == 0) {
+    return $data;
+  }
+
+  // Find all completed orders with a line item = previous product variant
+  $efq = new EntityFieldQuery();
+  $efq->entityCondition('entity_type', 'commerce_line_item')
+      ->entityCondition('bundle', 'product')
+      ->fieldCondition('commerce_product', 'product_id', $pids, 'IN');
+  $results = $efq->execute();
+
+  if (!isset($results['commerce_line_item'])) {
+    return $data;
+  }
+
+  $lids = array_keys($results['commerce_line_item']);
+  $line_items = commerce_line_item_load_multiple($lids);
+
+  // Make sure these line items are part of a completed order
+  $completed_line_items = array_filter($line_items, function($line_item) {
+    $order = commerce_order_load($line_item->order_id);
+    if ($order->status == 'completed') {
+      return TRUE;
+    }
+
+    return FALSE;
+  });
+
+  foreach ($completed_line_items as $lid => $line_item) {
+    $book_qty = isset($data['books'][$line_item->line_item_label]['qty']) ? $data['books'][$line_item->line_item_label]['qty'] : 0;
+    $book_total = isset($data['books'][$line_item->line_item_label]['total']) ? $data['books'][$line_item->line_item_label]['total'] : 0;
+    $item_amount = $line_item->commerce_total[LANGUAGE_NONE][0]['amount'];
+
+    $data['books'][$line_item->line_item_label] = array(
+      'qty' => $book_qty + $line_item->quantity,
+      'total' => $book_total + $item_amount,
+    );
+  }
+
+  $sum_sales = commerce_line_items_total($completed_line_items);
+
+  $gross_royalties = $sum_sales['amount'] * .768;
+  $data['gross_royalties'] = array(
+    'amount' => $gross_royalties,
+    'currency_code' => $sum_sales['currency_code'],
+    'amount_formatted' => commerce_currency_format($gross_royalties, $sum_sales['currency_code']),
+  );
+
+  $net_royalties = $gross_royalties;
+  $payments = _ebg_royalties_payments_user($uid);
+
+  foreach ($payments as $payment) {
+    $net_royalties -= ($payment->amount * 100);
+  }
+
+  $data['payments'] = $payments;
+  $data['net_royalties'] = array(
+    'amount' => $net_royalties,
+    'currency_code' => $sum_sales['currency_code'],
+    'amount_formatted' => commerce_currency_format($net_royalties, $sum_sales['currency_code']),
+  );
+
+
+  return $data;
+}
+
+/**
+ * Get all payments to a user.
+ */
+function _ebg_royalties_payments_user($uid) {
+  $sql = 'select date, amount from {ebg_payments} where uid = :uid';
+
+  $query = db_query($sql, array(':uid' => $uid));
+
+  return $query->fetchAll();
+}
+
+/**
+ * Get a spcific payment.
+ */
+function _ebg_royalties_payment_get($id) {
+  $sql = 'select pid, uid, date, amount, notes from {ebg_payments} where pid = :pid';
+
+  $query = db_query($sql, array(':pid' => $id));
+
+  return $query->fetchObject();
+}
